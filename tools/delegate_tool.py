@@ -1668,7 +1668,20 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
+        # ``session_prompt_tokens`` is CUMULATIVE: it sums ``prompt_tokens``
+        # across every API call this session (``session_prompt_tokens +=
+        # prompt_tokens`` in the conversation loop), so after a handful of
+        # turns it exceeds ``context_length``, headroom goes <= 0, and EVERY
+        # subagent summary is trimmed to the ``_MIN_SUMMARY_CHARS`` floor no
+        # matter how full the parent's context actually is. That forces the
+        # read_file spill-file pointer, which weaker/quantized parents can loop
+        # on. Measure the parent's *current* context instead, via the
+        # compressor's ``last_prompt_tokens`` (the most recent call's prompt
+        # size), falling back to the legacy cumulative field only when the
+        # current value is unavailable (e.g. before the first API call).
+        used_tokens = getattr(compressor, "last_prompt_tokens", 0) or getattr(
+            parent_agent, "session_prompt_tokens", 0
+        )
         if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
             used_tokens = 0
 

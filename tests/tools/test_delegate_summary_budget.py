@@ -16,14 +16,20 @@ import tools.delegate_tool as dt
 
 
 class _FakeCompressor:
-    def __init__(self, context_length, max_tokens):
+    def __init__(self, context_length, max_tokens, last_prompt_tokens=0):
         self.context_length = context_length
         self.max_tokens = max_tokens
+        # Current live context size (last API call's prompt). 0 = no call yet.
+        self.last_prompt_tokens = last_prompt_tokens
 
 
 class _FakeParent:
-    def __init__(self, context_length, used_tokens, max_tokens):
-        self.context_compressor = _FakeCompressor(context_length, max_tokens)
+    def __init__(self, context_length, used_tokens, max_tokens, last_prompt_tokens=0):
+        self.context_compressor = _FakeCompressor(
+            context_length, max_tokens, last_prompt_tokens
+        )
+        # Cumulative session counter (summed across all calls) — must NOT be
+        # used to size the budget; kept here to prove it is ignored.
         self.session_prompt_tokens = used_tokens
 
 
@@ -84,9 +90,41 @@ def test_dynamic_budget_shrinks_as_batch_grows():
 def test_floor_enforced_when_parent_over_budget():
     # Parent already over its context budget → each summary gets only the floor.
     budget = dt._parent_summary_char_budget(
-        _FakeParent(131_000, 200_000, 8_000), 3
+        _FakeParent(131_000, 200_000, 8_000, last_prompt_tokens=200_000), 3
     )
     assert budget == dt._MIN_SUMMARY_CHARS
+
+
+def test_budget_uses_current_context_not_cumulative_session_tokens(monkeypatch):
+    # Regression: the budget must measure the parent's *current* context
+    # (compressor.last_prompt_tokens), NOT the cumulative session counter
+    # (session_prompt_tokens), which grows past context_length after a few
+    # turns and would starve every summary to the floor even when the live
+    # context is nearly empty.
+    #
+    # Parent: 131k window, live context only 27k (plenty of headroom), but the
+    # cumulative counter reads 130k (5 turns × ~26k). If the cumulative value
+    # leaked into the sizing, headroom would be <= 0 → floor. It must not.
+    parent = _FakeParent(
+        context_length=131_000,
+        used_tokens=130_000,        # cumulative — the trap
+        max_tokens=8_000,
+        last_prompt_tokens=27_000,  # current context — the truth
+    )
+    budget = dt._parent_summary_char_budget(parent, 3)
+    assert budget is not None
+    # Headroom is large, so the per-summary budget is well above the floor.
+    assert budget > dt._MIN_SUMMARY_CHARS
+
+    # End-to-end: a modest ~7 KB summary must NOT be truncated (no read_file
+    # spill pointer, so the parent never enters the pagination loop).
+    with tempfile.TemporaryDirectory() as td:
+        monkeypatch.setenv("HERMES_HOME", os.path.join(td, ".hermes"))
+        summary = "S" * 7_000
+        results = [{"task_index": 0, "summary": summary, "status": "completed"}]
+        dt._apply_summary_budget(results, parent)
+        assert "summary_truncated" not in results[0]
+        assert results[0]["summary"] == summary
 
 
 def test_unknown_context_falls_back_to_static_ceiling(monkeypatch):
